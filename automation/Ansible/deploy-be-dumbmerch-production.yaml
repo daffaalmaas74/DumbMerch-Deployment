@@ -1,0 +1,156 @@
+- name: Deploy be-dumbmerch Production
+  hosts: master
+  become: true
+
+  tasks:
+
+    - name: Test koneksi SSH ke GitHub
+      ansible.builtin.command:
+        cmd: ssh -o StrictHostKeyChecking=no -T git@github.com
+      register: github_ssh
+      changed_when: false
+      failed_when: false
+
+    - name: Clone repository branch production
+      ansible.builtin.git:
+        repo: "{{ be_dumbmerch_repo_url }}"
+        dest: "{{ be_dumbmerch_app_dir }}"
+        version: production
+        key_file: "/home/{{ new_user }}/.ssh/id_ed25519"
+        accept_hostkey: true
+
+    - name: Buat Dockerfile
+      ansible.builtin.copy:
+        dest: "{{ be_dumbmerch_app_dir }}/Dockerfile"
+        owner: "{{ new_user }}"
+        group: "{{ new_user }}"
+        mode: "0644"
+        content: |
+          FROM golang:1.18-alpine AS builder
+
+          WORKDIR /app
+
+          COPY go.mod go.sum ./
+          RUN go mod download
+
+          COPY . .
+
+          RUN CGO_ENABLED=0 GOOS=linux go build -o be-dumbmerch .
+
+          FROM alpine:3.14
+
+          WORKDIR /app
+
+          RUN apk add --no-cache ca-certificates
+
+          COPY --from=builder /app/be-dumbmerch .
+          COPY --from=builder /app/.env .
+
+          EXPOSE 5000
+
+          CMD ["./be-dumbmerch"]
+
+    - name: Login ke private registry
+      ansible.builtin.command:
+        cmd: >
+          docker login registry.daffaalmaas.studentdumbways.my.id
+          -u "{{ registry_username }}"
+          -p "{{ registry_password }}"
+      no_log: true
+
+    - name: Build image be-dumbmerch
+      ansible.builtin.command:
+        cmd: >
+          docker build
+          -t {{ registry_image_backend_production }}
+          .
+        chdir: "{{ be_dumbmerch_app_dir }}"
+
+    - name: Push image be-dumbmerch ke private registry
+      ansible.builtin.command:
+        cmd: docker push {{ registry_image_backend_production }}
+
+    - name: Buat namespace backend
+      ansible.builtin.shell:
+        cmd: |
+          kubectl create namespace backend \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Buat Secret private registry
+      ansible.builtin.shell:
+        cmd: >
+          kubectl create secret docker-registry registry-secret
+          --namespace backend
+          --docker-server=registry.daffaalmaas.studentdumbways.my.id
+          --docker-username="{{ registry_username }}"
+          --docker-password="{{ registry_password }}"
+          --dry-run=client -o yaml |
+          kubectl apply -f -
+      no_log: true
+
+    - name: Buat Deployment be-dumbmerch
+      ansible.builtin.copy:
+        dest: "{{ be_dumbmerch_app_dir }}/deployment.yaml"
+        owner: "{{ new_user }}"
+        group: "{{ new_user }}"
+        mode: "0644"
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: be-dumbmerch
+            namespace: backend
+          spec:
+            replicas: 1
+
+            selector:
+              matchLabels:
+                app: be-dumbmerch
+
+            template:
+              metadata:
+                labels:
+                  app: be-dumbmerch
+
+              spec:
+                imagePullSecrets:
+                  - name: registry-secret
+
+                containers:
+                  - name: be-dumbmerch
+                    image: "{{ registry_image_backend_production }}"
+                    imagePullPolicy: Always
+
+                    ports:
+                      - containerPort: 5000
+
+    - name: Apply Deployment be-dumbmerch
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ be_dumbmerch_app_dir }}/deployment.yaml
+
+    - name: Buat Service be-dumbmerch
+      ansible.builtin.copy:
+        dest: "{{ be_dumbmerch_app_dir }}/service.yaml"
+        owner: "{{ new_user }}"
+        group: "{{ new_user }}"
+        mode: "0644"
+        content: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: be-dumbmerch
+            namespace: backend
+          spec:
+            selector:
+              app: be-dumbmerch
+
+            ports:
+              - protocol: TCP
+                port: 5000
+                targetPort: 5000
+
+            type: ClusterIP
+
+    - name: Apply Service be-dumbmerch
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ be_dumbmerch_app_dir }}/service.yaml
